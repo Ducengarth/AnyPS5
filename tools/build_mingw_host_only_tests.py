@@ -1,10 +1,18 @@
 import argparse
+import collections
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+
+from select_tests import FULL, LOCAL, changed_paths as read_changed_paths, load_graph
+
+HOST_BROAD_CHANGES = {"CMakeLists.txt", ".github/workflows/build.yml", "tools/build_mingw_host_only_tests.py"}
+HEADERS = (".h", ".hh", ".hpp", ".inl")
+COMPILED = (".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm", ".s", ".asm")
+BUILD_FILES = re.compile(f"(?:{FULL.pattern})|(?:{LOCAL.pattern})", re.IGNORECASE)
 
 
 def object_document(value, path, name):
@@ -158,7 +166,7 @@ def source_relative_path(source_root, source):
         return None
 
 
-def host_only_test_targets(source_root, targets, changed_paths=None):
+def host_only_test_targets(source_root, targets, changed_paths=None, graph=None, graph_changed=None):
     selected = []
     for target in targets.values():
         if target.get("type") != "EXECUTABLE":
@@ -177,16 +185,91 @@ def host_only_test_targets(source_root, targets, changed_paths=None):
     selected = sorted(set(selected), key=str.casefold)
     if changed_paths is None:
         return selected
+    return changed_test_targets(source_root, targets, selected, changed_paths, HOST_BROAD_CHANGES, graph, graph_changed)
+
+
+def local_build_change(path):
+    return path.startswith("core/libs/") and (path.endswith(HEADERS) or Path(path).name == "CMakeLists.txt")
+
+
+def graph_key(path):
+    path = str(path).replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path.casefold()
+
+
+def read_graph(path, changed_since=None):
+    if path is None:
+        return None, None
+    try:
+        graph = load_graph(path)
+        since = None if changed_since is None else read_changed_paths(changed_since)
+    except (OSError, ValueError) as error:
+        print(f"Test graph not used; header and CMake changes select every test: {error}")
+        return None, None
+    return graph, since
+
+
+def own_sources(source_root, target):
+    return {
+        graph_key(relative)
+        for item in target.get("sources", []) if not item.get("isGenerated")
+        for relative in [source_relative_path(source_root, source_root / item["path"])]
+        if relative is not None
+    }
+
+
+def graph_test_targets(source_root, targets, selected, changed, graph, since=None):
+    if graph is None:
+        return None
+    paths = {graph_key(path) for path in [*changed, *(since or ())] if path}
+    if any(BUILD_FILES.search(path) for path in paths):
+        return None
+    keys = {}
+    def key(path):
+        if path not in keys:
+            keys[path] = graph_key(path)
+        return keys[path]
+    closures = collections.defaultdict(set)
+    for output, files in graph["closures"].items():
+        closures[key(output)].update(map(key, files))
+    known = set().union(*closures.values())
+    for test in graph["tests"].values():
+        known.update(map(key, test["registered"] + test["arguments"]))
+    candidates = set(selected)
+    sources = collections.defaultdict(set)
+    scopes = collections.defaultdict(set)
+    for target in targets.values():
+        name = target.get("name")
+        if name not in candidates:
+            continue
+        sources[name] |= own_sources(source_root, target)
+        for artifact in target.get("artifacts", []):
+            scopes[name] |= closures.get(graph_key(artifact.get("path", "")), set())
+    owned = set().union(*sources.values())
+    for path in paths - known:
+        if path.startswith("core/libs/") and (path.endswith(HEADERS) or path.endswith(COMPILED) and path not in owned):
+            return None
+    affected = set()
+    for name in candidates:
+        scope, files = scopes[name], sources[name]
+        if (not any(path.endswith(HEADERS) for path in scope)
+                or not {path for path in files if path.endswith(COMPILED)} <= scope
+                or scope & paths or files & paths):
+            affected.add(name)
+    return affected
+
+
+def changed_test_targets(source_root, targets, selected, changed_paths, broad_changes, graph=None, graph_changed=None):
     changed = {Path(path).as_posix() for path in changed_paths if path}
-    broad_change = any(
-        path in {"CMakeLists.txt", ".github/workflows/build.yml", "tools/build_mingw_host_only_tests.py"}
-        or path.startswith("core/libs/") and (
-            path.endswith((".h", ".hpp", ".hh", ".inl")) or Path(path).name == "CMakeLists.txt"
-        )
-        for path in changed
-    )
-    if broad_change:
+    if any(path in broad_changes for path in changed):
         return selected
+    affected = set()
+    if any(local_build_change(path) for path in changed):
+        affected = graph_test_targets(source_root, targets, selected, changed, graph, graph_changed)
+        if affected is None:
+            return selected
     changed_source = {
         relative
         for target in targets.values()
@@ -196,14 +279,14 @@ def host_only_test_targets(source_root, targets, changed_paths=None):
         if relative is not None
     }
     matched_sources = changed & changed_source
-    if matched_sources:
+    if matched_sources or affected:
         return [
             target["name"] for target in targets.values()
             if target.get("name") in selected
-            and any(
+            and (target["name"] in affected or any(
                 source_relative_path(source_root, source_root / item["path"]) in matched_sources
                 for item in target.get("sources", []) if not item.get("isGenerated")
-            )
+            ))
         ]
     return []
 
@@ -213,11 +296,14 @@ def main(argv=None):
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("changed_paths", nargs="?", type=Path)
     parser.add_argument("--list-only", action="store_true")
+    parser.add_argument("--graph", type=Path, help="test graph written by select_tests.py dump")
+    parser.add_argument("--graph-changed", type=Path, help="paths changed since the commit the test graph was written from")
     args = parser.parse_args(argv)
     try:
         source_root, targets = read_reply(Path(os.path.realpath(args.build_dir)))
         changed_paths = args.changed_paths.read_text(encoding="utf-8").splitlines() if args.changed_paths else None
-        selected = host_only_test_targets(source_root, targets, changed_paths)
+        graph, graph_changed = read_graph(args.graph, args.graph_changed) if changed_paths is not None else (None, None)
+        selected = host_only_test_targets(source_root, targets, changed_paths, graph, graph_changed)
         if not selected:
             print("No changed host-only core/libs test executables require a link check")
             return 0

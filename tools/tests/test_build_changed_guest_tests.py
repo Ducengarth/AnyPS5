@@ -93,6 +93,98 @@ class GuestTestTargets(unittest.TestCase):
         self.assertEqual(self.selections(self.fixture([guest]), ["core/relinker/codegen/src/Amd64OnlyConverter.cpp"]), [])
 
 
+class GuestGraphSelection(unittest.TestCase):
+    target = GuestTestTargets.target
+    fixture = GuestTestTargets.fixture
+    setUp = GuestTestTargets.setUp
+    tearDown = GuestTestTargets.tearDown
+
+    def build(self):
+        if not hasattr(self, "build_dir"):
+            self.build_dir = self.fixture([
+                self.target("guest_a_tests", source="core/libs/tests/GuestA.cpp", fragment="libc.prx"),
+                self.target("guest_b_tests", source="core/libs/tests/GuestB.cpp", fragment="libc.prx"),
+                self.target("host_tests", source="core/libs/tests/Host.cpp"),
+            ])
+        return self.build_dir
+
+    def graph(self):
+        closures = {
+            "tests/guest_a_tests.exe": ["core/libs/tests/GuestA.cpp", "core/libs/prx/libc/include/SonyCrt.hpp"],
+            "tests/guest_b_tests.exe": ["core/libs/tests/GuestB.cpp", "core/libs/prx/libc/include/SonyCrt.hpp",
+                                        "core/libs/prx/libScePad/include/Pad.hpp"],
+            "tests/host_tests.exe": ["core/libs/tests/Host.cpp", "core/libs/tests/Host.hpp"],
+        }
+        tests = {Path(output).stem: {"registered": [], "arguments": [], "sets": [], "requires": [], "depends": [],
+                                     "target": output} for output in closures}
+        return {"tests": tests, "closures": closures}
+
+    def selections(self, changed, graph=None, since=None):
+        source_root, targets = build_changed_guest_tests.host_only.read_reply(self.build().resolve())
+        return build_changed_guest_tests.guest_test_targets(source_root, targets, changed, graph, since)
+
+    def test_a_header_selects_only_the_guest_tests_that_include_it(self):
+        self.assertEqual(self.selections(["core/libs/prx/libScePad/include/Pad.hpp"], self.graph()), ["guest_b_tests"])
+
+    def test_a_shared_guest_header_selects_every_guest_test_including_it(self):
+        self.assertEqual(self.selections(["core/libs/prx/libc/include/SonyCrt.hpp"], self.graph()),
+                         ["guest_a_tests", "guest_b_tests"])
+
+    def test_a_header_of_a_host_only_test_selects_no_guest_test(self):
+        self.assertEqual(self.selections(["core/libs/tests/Host.hpp"], self.graph()), [])
+
+    def test_without_a_graph_a_header_selects_every_guest_test(self):
+        self.assertEqual(self.selections(["core/libs/prx/libScePad/include/Pad.hpp"]), ["guest_a_tests", "guest_b_tests"])
+
+    def test_guest_build_wide_paths_keep_the_broad_selection(self):
+        for path in ("tools/build_changed_guest_tests.py", "core/libs/prx/libScePad/CMakeLists.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(self.selections(["core/libs/prx/libScePad/include/Pad.hpp", path], self.graph()),
+                                 ["guest_a_tests", "guest_b_tests"])
+
+    def test_source_only_changes_are_unchanged_by_the_graph(self):
+        for changed in (["core/libs/tests/GuestB.cpp"], ["core/libs/prx/libc/src/FloatBuiltins.cpp"]):
+            with self.subTest(changed=changed):
+                self.assertEqual(self.selections(changed, self.graph()), self.selections(changed))
+
+    def test_main_builds_and_runs_only_the_guest_tests_the_graph_selects(self):
+        build = self.build()
+        directory = Path(self.temporary.name)
+        changed = directory / "changed.txt"
+        changed.write_text("core/libs/prx/libScePad/include/Pad.hpp\n", encoding="utf-8")
+        graph = directory / "test-graph.json"
+        graph.write_text(json.dumps(self.graph()), encoding="utf-8")
+        listing = json.dumps({"tests": [{"name": "guest_a", "command": ["C:/b/tests/guest_a_tests.exe"]},
+                                        {"name": "guest_b", "command": ["C:/b/tests/guest_b_tests.exe"]}]})
+        calls = []
+        def execute(cmd, **_):
+            calls.append(cmd)
+            return run_result(listing if "--show-only=json-v1" in cmd else "")
+        output = io.StringIO()
+        with mock.patch.object(build_changed_guest_tests.subprocess, "run", side_effect=execute), \
+                contextlib.redirect_stdout(output):
+            code = build_changed_guest_tests.main([str(build), str(changed), "--graph", str(graph),
+                                                   "--graph-changed", str(changed)])
+        self.assertEqual(code, 0)
+        builds = [cmd[cmd.index("--target") + 1:] for cmd in calls if cmd[0] == "cmake"]
+        self.assertEqual(builds, [["libs"], ["guest_b_tests"]])
+        self.assertIn("Guest core/libs tests:\nguest_b_tests\n", output.getvalue())
+
+    def test_main_with_a_corrupt_graph_runs_every_guest_test(self):
+        build = self.build()
+        directory = Path(self.temporary.name)
+        changed = directory / "changed.txt"
+        changed.write_text("core/libs/prx/libScePad/include/Pad.hpp\n", encoding="utf-8")
+        graph = directory / "test-graph.json"
+        graph.write_text("{not json", encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(build_changed_guest_tests, "run") as run, contextlib.redirect_stdout(output):
+            code = build_changed_guest_tests.main([str(build), str(changed), "--graph", str(graph)])
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_args.args[1], ["guest_a_tests", "guest_b_tests"])
+        self.assertIn("Test graph not used", output.getvalue())
+
+
 class OwnerResolution(unittest.TestCase):
     def test_resolves_the_executable_not_a_test_argument(self):
         owner = build_changed_guest_tests.test_owner(

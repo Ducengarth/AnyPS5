@@ -25,7 +25,7 @@ def reaches_libs(changed):
     )
 
 
-def guest_test_targets(source_root, targets, changed_paths=None):
+def guest_test_targets(source_root, targets, changed_paths=None, graph=None, graph_changed=None):
     selected = []
     for target in targets.values():
         if target.get("type") != "EXECUTABLE":
@@ -44,31 +44,8 @@ def guest_test_targets(source_root, targets, changed_paths=None):
     selected = sorted(set(selected), key=str.casefold)
     if changed_paths is None:
         return selected
-    changed = {Path(path).as_posix() for path in changed_paths if path}
-    broad_change = any(path in BROAD_CHANGES or path.startswith("core/libs/") and (
-        path.endswith((".h", ".hpp", ".hh", ".inl")) or Path(path).name == "CMakeLists.txt"
-    ) for path in changed)
-    if broad_change:
-        return selected
-    changed_source = {
-        relative
-        for target in targets.values()
-        if target.get("name") in selected
-        for item in target.get("sources", []) if not item.get("isGenerated")
-        for relative in [host_only.source_relative_path(source_root, source_root / item["path"])]
-        if relative is not None
-    }
-    matched_sources = changed & changed_source
-    if matched_sources:
-        return [
-            target["name"] for target in targets.values()
-            if target.get("name") in selected
-            and any(
-                host_only.source_relative_path(source_root, source_root / item["path"]) in matched_sources
-                for item in target.get("sources", []) if not item.get("isGenerated")
-            )
-        ]
-    return []
+    return host_only.changed_test_targets(
+        source_root, targets, selected, changed_paths, BROAD_CHANGES, graph, graph_changed)
 
 
 def target_artifact_names(target):
@@ -130,6 +107,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="build and run changed core/libs tests that link guest libc")
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("changed_paths", nargs="?", type=Path)
+    parser.add_argument("--graph", type=Path, help="test graph written by select_tests.py dump")
+    parser.add_argument("--graph-changed", type=Path, help="paths changed since the commit the test graph was written from")
     args = parser.parse_args(argv)
     try:
         if args.changed_paths is not None:
@@ -139,7 +118,9 @@ def main(argv=None):
                 return 0
         source_root, targets = host_only.read_reply(Path(os.path.realpath(args.build_dir)))
         changed_paths = args.changed_paths.read_text(encoding="utf-8").splitlines() if args.changed_paths else None
-        selected = guest_test_targets(source_root, targets, changed_paths)
+        graph, graph_changed = (host_only.read_graph(args.graph, args.graph_changed)
+                                if changed_paths is not None else (None, None))
+        selected = guest_test_targets(source_root, targets, changed_paths, graph, graph_changed)
         if not selected:
             print("No guest core/libs test sources changed")
         else:

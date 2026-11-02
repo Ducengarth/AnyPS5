@@ -1,7 +1,10 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -419,7 +422,266 @@ class HostOnlyTargets(unittest.TestCase):
         self.assert_exact_file_argument_links_product("-Wl,-l:libproduct_lib.a")
 
 
+ALL_TARGETS = ["first_tests", "second_tests", "third_tests"]
+
+
+class GraphSelection(unittest.TestCase):
+    target = HostOnlyTargets.target
+    fixture = HostOnlyTargets.fixture
+    setUp = HostOnlyTargets.setUp
+    tearDown = HostOnlyTargets.tearDown
+
+    def targets(self):
+        if not hasattr(self, "reply"):
+            self.reply = build_mingw_host_only_tests.read_reply(self.fixture([
+                self.target("first_tests", source="core/libs/tests/First.cpp"),
+                self.target("second_tests", source="core/libs/tests/Second.cpp"),
+                self.target("third_tests", source="core/libs/tests/Third.cpp"),
+            ]))
+        return self.reply
+
+    def graph(self, **closures):
+        files = {
+            "first_tests": ["core/libs/tests/First.cpp", "core/libs/tests/First.hpp", "core/libs/tests/Shared.hpp"],
+            "second_tests": ["core/libs/tests/Second.cpp", "core/libs/tests/Second.hpp", "core/libs/tests/Shared.hpp",
+                             "core/libs/tests/helper/Helper.cpp", "core/libs/tests/helper/include/Helper.hpp",
+                             "core/libs/tests/helper/include/Inner.inl"],
+            "third_tests": ["core/libs/tests/Third.cpp", "core/libs/tests/Third.hh"],
+        }
+        files.update(closures)
+        files = {name: paths for name, paths in files.items() if paths is not None}
+        tests = {name: {"registered": ["core/libs/CMakeLists.txt"], "arguments": [], "sets": [], "requires": [],
+                        "depends": [], "target": f"tests/{name}.exe"} for name in files}
+        return {"tests": tests, "closures": {f"tests/{name}.exe": paths for name, paths in files.items()}}
+
+    def select(self, changed, graph=None, since=None, use_graph=True):
+        source_root, targets = self.targets()
+        if use_graph and graph is None:
+            graph = self.graph()
+        return build_mingw_host_only_tests.host_only_test_targets(source_root, targets, changed, graph, since)
+
+    def write_graph(self, document):
+        path = Path(self.temporary.name) / "test-graph.json"
+        path.write_text(document if isinstance(document, str) else json.dumps(document), encoding="utf-8")
+        return path
+
+    def test_a_header_of_one_target_selects_only_that_target(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"]), ["first_tests"])
+
+    def test_a_shared_header_selects_every_target_including_it(self):
+        self.assertEqual(self.select(["core/libs/tests/Shared.hpp"]), ["first_tests", "second_tests"])
+
+    def test_a_header_reached_through_a_linked_helper_selects_its_dependents(self):
+        self.assertEqual(self.select(["core/libs/tests/helper/include/Inner.inl"]), ["second_tests"])
+
+    def test_a_header_the_graph_does_not_know_selects_every_target(self):
+        self.assertEqual(self.select(["core/libs/tests/New.hpp"]), ALL_TARGETS)
+
+    def test_no_graph_keeps_the_broad_selection(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"], use_graph=False), ALL_TARGETS)
+
+    def test_a_known_header_no_target_includes_selects_nothing(self):
+        graph = self.graph()
+        graph["closures"]["tests/other.exe"] = ["core/libs/other/Other.cpp", "core/libs/other/Other.hpp"]
+        self.assertEqual(self.select(["core/libs/other/Other.hpp"], graph), [])
+
+    def test_several_headers_select_the_union_of_their_dependents(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp", "core/libs/tests/Third.hh"]),
+                         ["first_tests", "third_tests"])
+
+    def test_a_header_with_a_build_wide_change_selects_every_target(self):
+        for path in ("CMakeLists.txt", ".github/workflows/build.yml", "tools/build_mingw_host_only_tests.py",
+                     "cmake/Toolchain.cmake", "3rdparty/zlib/zlib.h", "tools/select_tests.py", "core/CMakeLists.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(self.select(["core/libs/tests/First.hpp", path]), ALL_TARGETS)
+
+    def test_a_header_with_a_test_source_selects_both_targets(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp", "core/libs/tests/Third.cpp"]),
+                         ["first_tests", "third_tests"])
+
+    def test_a_header_with_a_known_library_source_selects_its_dependents(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp", "core/libs/tests/helper/Helper.cpp"]),
+                         ["first_tests", "second_tests"])
+
+    def test_a_header_with_an_unknown_library_source_selects_every_target(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp", "core/libs/tests/helper/New.cpp"]), ALL_TARGETS)
+
+    def test_a_header_with_an_unrelated_file_selects_its_dependents(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp", "docs/dev/BUILD.md", "core/libs/prx/x/notes.md"]),
+                         ["first_tests"])
+
+    def test_cmake_changes_keep_the_broad_selection(self):
+        for changed in (["core/libs/tests/CMakeLists.txt"], ["core/libs/CMakeLists.txt"],
+                        ["core/libs/tests/First.hpp", "core/libs/tests/helper/CMakeLists.txt"],
+                        ["core/libs/tests/First.hpp", "core/libs/prx/libSceFontFt/FontFtLibrary.cmake"]):
+            with self.subTest(changed=changed):
+                self.assertEqual(self.select(changed), ALL_TARGETS)
+
+    def test_changes_since_the_graph_commit_widen_the_selection(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"],
+                                     since=["core/libs/tests/First.hpp", "core/libs/tests/Third.cpp"]),
+                         ["first_tests", "third_tests"])
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"], since=["core/libs/tests/helper/include/Helper.hpp"]),
+                         ["first_tests", "second_tests"])
+
+    def test_build_file_changes_since_the_graph_commit_select_every_target(self):
+        for path in ("core/libs/prx/libScePad/CMakeLists.txt", "3rdparty/zlib", ".gitmodules", "core/libs/tests/Gone.hpp"):
+            with self.subTest(path=path):
+                self.assertEqual(self.select(["core/libs/tests/First.hpp"], since=[path]), ALL_TARGETS)
+
+    def test_a_target_missing_from_the_graph_is_selected(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"], self.graph(third_tests=None)),
+                         ["first_tests", "third_tests"])
+
+    def test_a_target_without_recorded_header_dependencies_is_selected(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"], self.graph(third_tests=["core/libs/tests/Third.cpp"])),
+                         ["first_tests", "third_tests"])
+
+    def test_a_target_whose_sources_moved_since_the_graph_is_selected(self):
+        graph = self.graph(third_tests=["core/libs/tests/OldThird.cpp", "core/libs/tests/Third.hh"])
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"], graph), ["first_tests", "third_tests"])
+
+    def test_source_only_changes_select_the_same_targets_with_or_without_a_graph(self):
+        for changed in (["core/libs/tests/Second.cpp"], ["core/libs/prx/libc/src/FloatBuiltins.cpp"],
+                        ["core/relinker/codegen/src/Amd64OnlyConverter.cpp"], ["core/common/Shared.hpp"]):
+            with self.subTest(changed=changed):
+                self.assertEqual(self.select(changed), self.select(changed, use_graph=False))
+
+    def test_windows_separators_and_case_in_the_graph_still_match(self):
+        graph = self.graph()
+        graph["closures"] = {key.upper().replace("/", "\\"): [path.replace("/", "\\").upper() for path in files]
+                             for key, files in graph["closures"].items()}
+        graph["tests"] = {name: dict(test, target=test["target"].upper().replace("/", "\\"))
+                          for name, test in graph["tests"].items()}
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"], graph), ["first_tests"])
+        self.assertEqual(self.select(["core/libs/TESTS/first.hpp"]), ["first_tests"])
+
+    def test_read_graph_rejects_missing_and_malformed_graphs(self):
+        documents = {
+            "missing": None,
+            "invalid json": "{",
+            "wrong shape": {"tests": [], "closures": {}},
+            "missing closure": {"tests": {"t": {"registered": [], "arguments": [], "sets": [], "requires": [],
+                                                "depends": [], "target": "tests/t.exe"}}, "closures": {}},
+        }
+        for name, document in documents.items():
+            with self.subTest(name=name):
+                path = Path(self.temporary.name) / "absent.json" if document is None else self.write_graph(document)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(build_mingw_host_only_tests.read_graph(path), (None, None))
+                self.assertIn("Test graph not used", output.getvalue())
+
+    def test_read_graph_rejects_an_unreadable_changed_since_list(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(build_mingw_host_only_tests.read_graph(
+                self.write_graph(self.graph()), Path(self.temporary.name) / "absent.txt"), (None, None))
+
+    def test_read_graph_reads_newline_and_nul_separated_changes(self):
+        for content in (b"core/libs/a.hpp\ncore/libs/b.cpp\n", b"core/libs/a.hpp\0core/libs/b.cpp\0"):
+            with self.subTest(content=content):
+                since = Path(self.temporary.name) / "since.txt"
+                since.write_bytes(content)
+                graph, paths = build_mingw_host_only_tests.read_graph(self.write_graph(self.graph()), since)
+                self.assertEqual(graph, self.graph())
+                self.assertEqual(paths, ["core/libs/a.hpp", "core/libs/b.cpp"])
+
+    def run_main(self, *options, changed=("core/libs/tests/First.hpp",)):
+        self.targets()
+        listed = Path(self.temporary.name) / "changed.txt"
+        listed.write_text("\n".join(changed), encoding="utf-8")
+        output = io.StringIO()
+        build = Path(self.temporary.name) / "build"
+        with contextlib.redirect_stdout(output):
+            code = build_mingw_host_only_tests.main([str(build), str(listed), "--list-only", *map(str, options)])
+        self.assertEqual(code, 0)
+        return output.getvalue().splitlines()
+
+    def test_main_selects_from_the_graph(self):
+        since = Path(self.temporary.name) / "graph-changed.txt"
+        since.write_text("core/libs/tests/First.hpp\n", encoding="utf-8")
+        graph = self.write_graph(self.graph())
+        self.assertEqual(self.run_main("--graph", graph, "--graph-changed", since),
+                         ["Host-only core/libs test executables:", "first_tests"])
+
+    def test_main_without_a_usable_graph_checks_every_target(self):
+        lines = self.run_main("--graph", Path(self.temporary.name) / "test-graph.json")
+        self.assertTrue(lines[0].startswith("Test graph not used"))
+        self.assertEqual(lines[1:], ["Host-only core/libs test executables:", *ALL_TARGETS])
+
+
+@unittest.skipUnless(shutil.which("cmake") and shutil.which("ninja") and (shutil.which("gcc") or shutil.which("cc")),
+                     "needs cmake, ninja and a C compiler")
+class GraphSelectionFromARealBuild(unittest.TestCase):
+    PROJECT = {
+        "CMakeLists.txt": "cmake_minimum_required(VERSION 3.20)\nproject(mini C)\nenable_testing()\n"
+                          "add_subdirectory(core/libs)\n",
+        "core/libs/CMakeLists.txt": "add_library(test_helper STATIC tests/helper/Helper.c)\n"
+                                    "target_include_directories(test_helper PUBLIC tests/helper/include)\n"
+                                    "add_executable(first_tests tests/First.c)\n"
+                                    "target_link_libraries(first_tests PRIVATE test_helper)\n"
+                                    "add_executable(second_tests tests/Second.c)\n"
+                                    "add_test(NAME first COMMAND first_tests)\nadd_test(NAME second COMMAND second_tests)\n",
+        "core/libs/tests/helper/Helper.c": "#include \"Helper.h\"\nint helper(void) { return INNER; }\n",
+        "core/libs/tests/helper/include/Helper.h": "#include \"Inner.h\"\nint helper(void);\n",
+        "core/libs/tests/helper/include/Inner.h": "#define INNER 0\n",
+        "core/libs/tests/First.c": "int helper(void);\nint main(void) { return helper(); }\n",
+        "core/libs/tests/Second.c": "#include \"Second.h\"\nint main(void) { return SECOND; }\n",
+        "core/libs/tests/Second.h": "#define SECOND 0\n",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        root = Path(cls.directory.name)
+        cls.source, cls.build, cls.graph_path = root / "source", root / "build", root / "test-graph.json"
+        for name, content in cls.PROJECT.items():
+            (cls.source / name).parent.mkdir(parents=True, exist_ok=True)
+            (cls.source / name).write_text(content, encoding="utf-8")
+        query = cls.build / ".cmake" / "api" / "v1" / "query"
+        query.mkdir(parents=True)
+        (query / "codemodel-v2").touch()
+        compiler = shutil.which("gcc") or shutil.which("cc")
+        subprocess.run(["cmake", "-S", str(cls.source), "-B", str(cls.build), "-G", "Ninja", f"-DCMAKE_C_COMPILER={compiler}"],
+                       check=True, capture_output=True)
+        subprocess.run(["cmake", "--build", str(cls.build)], check=True, capture_output=True)
+        tool = Path(__file__).resolve().parents[1] / "select_tests.py"
+        subprocess.run([sys.executable, str(tool), "dump", str(cls.build), str(cls.graph_path)], check=True, capture_output=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def select(self, changed):
+        source_root, targets = build_mingw_host_only_tests.read_reply(Path(os.path.realpath(self.build)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph, since = build_mingw_host_only_tests.read_graph(self.graph_path)
+        self.assertIsNotNone(graph)
+        return build_mingw_host_only_tests.host_only_test_targets(source_root, targets, changed, graph, since)
+
+    def test_a_header_included_only_by_a_linked_helper_selects_its_dependent(self):
+        self.assertEqual(self.select(["core/libs/tests/helper/include/Inner.h"]), ["first_tests"])
+
+    def test_a_header_of_one_executable_selects_only_it(self):
+        self.assertEqual(self.select(["core/libs/tests/Second.h"]), ["second_tests"])
+
+    def test_an_unknown_header_selects_every_executable(self):
+        self.assertEqual(self.select(["core/libs/tests/Third.h"]), ["first_tests", "second_tests"])
+
+
 class WindowsPullRequestGateTests(unittest.TestCase):
+    def test_pull_requests_select_host_and_guest_tests_from_the_test_graph(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/build.yml").read_text(encoding="utf-8")
+        windows = workflow.split("\n  windows:\n", 1)[1].split("\n  edge-watch:\n", 1)[0]
+        restore = windows.split("- id: pr-graph\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("if: github.event_name == 'pull_request'", restore)
+        self.assertIn("key: test-graph-${{ runner.os }}-${{ needs.eligibility.outputs.sha }}", restore)
+        self.assertIn('git diff --no-renames --name-only "$graph" HEAD > graph-changed.txt', windows)
+        for script in ("build_mingw_host_only_tests.py", "build_changed_guest_tests.py"):
+            with self.subTest(script=script):
+                self.assertIn(f"python tools/{script} build changed.txt --graph test-graph.json "
+                              "--graph-changed graph-changed.txt", windows)
+
     def test_build_wide_inputs_start_the_windows_pull_request_job(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/build.yml").read_text(encoding="utf-8")
         gate = workflow.split("mingwHostTests: ", 1)[1].split("),", 1)[0]

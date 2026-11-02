@@ -700,19 +700,32 @@ jobs:
         if: github.event_name != 'pull_request'
         shell: cmd
         run: if exist build\select.ninja (ninja -C build -f select.ninja selected) else (cmake --build build)
+      - id: pr-graph
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v6
+        with:
+          path: test-graph.json
+          key: test-graph-${{ runner.os }}-${{ needs.eligibility.outputs.sha }}
+          restore-keys: test-graph-${{ runner.os }}-
       - name: List changed files for host-only test linking
         if: github.event_name == 'pull_request'
         env:
           BASE: ${{ needs.eligibility.outputs.sha }}
-        run: git diff --name-only "$BASE" HEAD > changed.txt
+          GRAPH_KEY: ${{ steps.pr-graph.outputs.cache-matched-key }}
+        run: |
+          git diff --name-only "$BASE" HEAD > changed.txt
+          graph="${GRAPH_KEY#test-graph-$RUNNER_OS-}"
+          if [ -z "$GRAPH_KEY" ] || [ ! -f test-graph.json ] || ! git diff --no-renames --name-only "$graph" HEAD > graph-changed.txt; then
+            rm -f test-graph.json graph-changed.txt
+          fi
       - name: Link changed host-only core/libs test executables
         if: github.event_name == 'pull_request'
         shell: cmd
-        run: python tools/build_mingw_host_only_tests.py build changed.txt
+        run: python tools/build_mingw_host_only_tests.py build changed.txt --graph test-graph.json --graph-changed graph-changed.txt
       - name: Build and run changed guest core/libs tests
         if: github.event_name == 'pull_request'
         shell: cmd
-        run: python tools/build_changed_guest_tests.py build changed.txt
+        run: python tools/build_changed_guest_tests.py build changed.txt --graph test-graph.json --graph-changed graph-changed.txt
       - id: libs
         if: github.event_name != 'pull_request'
         shell: cmd
