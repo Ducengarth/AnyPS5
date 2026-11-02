@@ -121,7 +121,8 @@ class GuestGraphSelection(unittest.TestCase):
 
     def selections(self, changed, graph=None, since=None):
         source_root, targets = build_changed_guest_tests.host_only.read_reply(self.build().resolve())
-        return build_changed_guest_tests.guest_test_targets(source_root, targets, changed, graph, since)
+        return build_changed_guest_tests.guest_test_targets(
+            source_root, targets, changed, graph, changed if since is None else since)
 
     def test_a_header_selects_only_the_guest_tests_that_include_it(self):
         self.assertEqual(self.selections(["core/libs/prx/libScePad/include/Pad.hpp"], self.graph()), ["guest_b_tests"])
@@ -179,10 +180,12 @@ class GuestGraphSelection(unittest.TestCase):
         graph.write_text("{not json", encoding="utf-8")
         output = io.StringIO()
         with mock.patch.object(build_changed_guest_tests, "run") as run, contextlib.redirect_stdout(output):
-            code = build_changed_guest_tests.main([str(build), str(changed), "--graph", str(graph)])
+            code = build_changed_guest_tests.main([str(build), str(changed), "--graph", str(graph),
+                                                   "--graph-changed", str(changed)])
         self.assertEqual(code, 0)
         self.assertEqual(run.call_args.args[1], ["guest_a_tests", "guest_b_tests"])
         self.assertIn("Test graph not used", output.getvalue())
+        self.assertIn("Expecting property name", output.getvalue())
 
 
 class OwnerResolution(unittest.TestCase):

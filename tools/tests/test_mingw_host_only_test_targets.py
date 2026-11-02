@@ -1,5 +1,6 @@
 import contextlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -458,7 +459,18 @@ class GraphSelection(unittest.TestCase):
         source_root, targets = self.targets()
         if use_graph and graph is None:
             graph = self.graph()
-        return build_mingw_host_only_tests.host_only_test_targets(source_root, targets, changed, graph, since)
+        return build_mingw_host_only_tests.host_only_test_targets(
+            source_root, targets, changed, graph, changed if since is None else since)
+
+    def select_from(self, targets, changed, graph=None):
+        source_root, targets = build_mingw_host_only_tests.read_reply(self.fixture(targets))
+        return build_mingw_host_only_tests.host_only_test_targets(
+            source_root, targets, changed, graph or self.graph(), changed)
+
+    def changed_since(self, *paths):
+        path = Path(self.temporary.name) / "graph-changed.txt"
+        path.write_text("".join(f"{item}\n" for item in paths), encoding="utf-8")
+        return path
 
     def write_graph(self, document):
         path = Path(self.temporary.name) / "test-graph.json"
@@ -503,8 +515,47 @@ class GraphSelection(unittest.TestCase):
         self.assertEqual(self.select(["core/libs/tests/First.hpp", "core/libs/tests/helper/Helper.cpp"]),
                          ["first_tests", "second_tests"])
 
-    def test_a_header_with_an_unknown_library_source_selects_every_target(self):
-        self.assertEqual(self.select(["core/libs/tests/First.hpp", "core/libs/tests/helper/New.cpp"]), ALL_TARGETS)
+    def test_unknown_headers_and_sources_anywhere_select_every_target(self):
+        for path in ("core/shader/recompiler/New.cpp", "core/common/New.hpp", "core/libs/tests/Tables.inc",
+                     "demo/src/New.ipp", "core/libs/tests/New.c", "core/libs/prx/libSceAgcDriver/tests/New.comp",
+                     "core/libs/tests/Version.rc"):
+            with self.subTest(path=path):
+                self.assertEqual(self.select(["core/libs/tests/First.hpp", path]), ALL_TARGETS)
+                self.assertEqual(self.select(["core/libs/tests/First.hpp"], since=["core/libs/tests/First.hpp", path]),
+                                 ALL_TARGETS)
+
+    def test_a_new_file_named_like_a_known_input_selects_every_target(self):
+        graph = self.graph(third_tests=["core/libs/tests/Third.cpp", "core/libs/tests/Third.hh", "core/libs/tests/data/Table.txt"])
+        self.assertEqual(self.select(["core/libs/tests/First.hpp", "core/libs/tests/first/Table.txt"], graph), ALL_TARGETS)
+
+    def test_a_new_source_of_one_test_selects_that_test(self):
+        third = self.target("third_tests", source="core/libs/tests/Third.cpp")
+        third["sources"].append({"path": "core/libs/tests/ThirdMore.cpp"})
+        targets = [self.target("first_tests", source="core/libs/tests/First.cpp"),
+                   self.target("second_tests", source="core/libs/tests/Second.cpp"), third]
+        self.assertEqual(self.select_from(targets, ["core/libs/tests/First.hpp", "core/libs/tests/ThirdMore.cpp"]),
+                         ["first_tests", "third_tests"])
+
+    def test_a_new_source_also_built_into_a_library_selects_every_target(self):
+        third = self.target("third_tests", source="core/libs/tests/Third.cpp")
+        third["sources"].append({"path": "core/libs/tests/helper/SharedNew.cpp"})
+        helper = self.target("test_helper", target_type="STATIC_LIBRARY", source="core/libs/tests/helper/SharedNew.cpp")
+        targets = [self.target("first_tests", source="core/libs/tests/First.cpp"),
+                   self.target("second_tests", source="core/libs/tests/Second.cpp"), third, helper]
+        self.assertEqual(self.select_from(targets, ["core/libs/tests/First.hpp", "core/libs/tests/helper/SharedNew.cpp"]),
+                         ALL_TARGETS)
+
+    def test_an_empty_graph_selects_every_target(self):
+        self.assertEqual(self.select(["core/libs/tests/First.hpp"], {"tests": {}, "closures": {}}), ALL_TARGETS)
+
+    def test_the_selection_does_not_depend_on_the_order_of_the_changes(self):
+        changed = ["core/libs/tests/Shared.hpp", "core/libs/tests/Third.cpp", "docs/dev/BUILD.md", "core/libs/tests/Third.hh"]
+        for order in itertools.permutations(changed):
+            with self.subTest(order=order):
+                self.assertEqual(self.select(list(order)), ALL_TARGETS)
+        for order in itertools.permutations(["core/libs/tests/First.hpp", "core/libs/tests/helper/include/Inner.inl"]):
+            with self.subTest(order=order):
+                self.assertEqual(self.select(list(order)), ["first_tests", "second_tests"])
 
     def test_a_header_with_an_unrelated_file_selects_its_dependents(self):
         self.assertEqual(self.select(["core/libs/tests/First.hpp", "docs/dev/BUILD.md", "core/libs/prx/x/notes.md"]),
@@ -569,8 +620,14 @@ class GraphSelection(unittest.TestCase):
                 path = Path(self.temporary.name) / "absent.json" if document is None else self.write_graph(document)
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
-                    self.assertEqual(build_mingw_host_only_tests.read_graph(path), (None, None))
+                    self.assertEqual(build_mingw_host_only_tests.read_graph(path, self.changed_since()), (None, None))
                 self.assertIn("Test graph not used", output.getvalue())
+
+    def test_read_graph_requires_the_paths_changed_since_the_graph_commit(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(build_mingw_host_only_tests.read_graph(self.write_graph(self.graph())), (None, None))
+        self.assertIn("Test graph not used", output.getvalue())
 
     def test_read_graph_rejects_an_unreadable_changed_since_list(self):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -605,9 +662,13 @@ class GraphSelection(unittest.TestCase):
                          ["Host-only core/libs test executables:", "first_tests"])
 
     def test_main_without_a_usable_graph_checks_every_target(self):
-        lines = self.run_main("--graph", Path(self.temporary.name) / "test-graph.json")
-        self.assertTrue(lines[0].startswith("Test graph not used"))
-        self.assertEqual(lines[1:], ["Host-only core/libs test executables:", *ALL_TARGETS])
+        since = self.changed_since("core/libs/tests/First.hpp")
+        for options in (("--graph", Path(self.temporary.name) / "absent-graph.json", "--graph-changed", since),
+                        ("--graph", self.write_graph(self.graph()))):
+            with self.subTest(options=options):
+                lines = self.run_main(*options)
+                self.assertTrue(lines[0].startswith("Test graph not used"))
+                self.assertEqual(lines[1:], ["Host-only core/libs test executables:", *ALL_TARGETS])
 
 
 @unittest.skipUnless(shutil.which("cmake") and shutil.which("ninja") and (shutil.which("gcc") or shutil.which("cc")),
@@ -615,17 +676,20 @@ class GraphSelection(unittest.TestCase):
 class GraphSelectionFromARealBuild(unittest.TestCase):
     PROJECT = {
         "CMakeLists.txt": "cmake_minimum_required(VERSION 3.20)\nproject(mini C)\nenable_testing()\n"
-                          "add_subdirectory(core/libs)\n",
+                          "add_subdirectory(core/common)\nadd_subdirectory(core/libs)\n",
+        "core/common/CMakeLists.txt": "file(GLOB commonSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.c)\n"
+                                      "add_library(common STATIC ${commonSources})\n",
+        "core/common/Common.c": "int common(void) { return 0; }\n",
         "core/libs/CMakeLists.txt": "add_library(test_helper STATIC tests/helper/Helper.c)\n"
                                     "target_include_directories(test_helper PUBLIC tests/helper/include)\n"
                                     "add_executable(first_tests tests/First.c)\n"
-                                    "target_link_libraries(first_tests PRIVATE test_helper)\n"
+                                    "target_link_libraries(first_tests PRIVATE test_helper common)\n"
                                     "add_executable(second_tests tests/Second.c)\n"
                                     "add_test(NAME first COMMAND first_tests)\nadd_test(NAME second COMMAND second_tests)\n",
         "core/libs/tests/helper/Helper.c": "#include \"Helper.h\"\nint helper(void) { return INNER; }\n",
         "core/libs/tests/helper/include/Helper.h": "#include \"Inner.h\"\nint helper(void);\n",
         "core/libs/tests/helper/include/Inner.h": "#define INNER 0\n",
-        "core/libs/tests/First.c": "int helper(void);\nint main(void) { return helper(); }\n",
+        "core/libs/tests/First.c": "int helper(void);\nint common(void);\nint main(void) { return helper() + common(); }\n",
         "core/libs/tests/Second.c": "#include \"Second.h\"\nint main(void) { return SECOND; }\n",
         "core/libs/tests/Second.h": "#define SECOND 0\n",
     }
@@ -633,29 +697,35 @@ class GraphSelectionFromARealBuild(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
-        root = Path(cls.directory.name)
-        cls.source, cls.build, cls.graph_path = root / "source", root / "build", root / "test-graph.json"
-        for name, content in cls.PROJECT.items():
-            (cls.source / name).parent.mkdir(parents=True, exist_ok=True)
-            (cls.source / name).write_text(content, encoding="utf-8")
-        query = cls.build / ".cmake" / "api" / "v1" / "query"
+        cls.root = Path(cls.directory.name)
+        cls.source, cls.build, cls.graph_path = cls.root / "source", cls.root / "build", cls.root / "test-graph.json"
+        cls.build_and_dump(cls.PROJECT, cls.source, cls.build, cls.graph_path)
+
+    @staticmethod
+    def build_and_dump(project, source, build, graph):
+        for name, content in project.items():
+            (source / name).parent.mkdir(parents=True, exist_ok=True)
+            (source / name).write_text(content, encoding="utf-8")
+        query = build / ".cmake" / "api" / "v1" / "query"
         query.mkdir(parents=True)
         (query / "codemodel-v2").touch()
         compiler = shutil.which("gcc") or shutil.which("cc")
-        subprocess.run(["cmake", "-S", str(cls.source), "-B", str(cls.build), "-G", "Ninja", f"-DCMAKE_C_COMPILER={compiler}"],
+        subprocess.run(["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", f"-DCMAKE_C_COMPILER={compiler}"],
                        check=True, capture_output=True)
-        subprocess.run(["cmake", "--build", str(cls.build)], check=True, capture_output=True)
+        subprocess.run(["cmake", "--build", str(build)], check=True, capture_output=True)
         tool = Path(__file__).resolve().parents[1] / "select_tests.py"
-        subprocess.run([sys.executable, str(tool), "dump", str(cls.build), str(cls.graph_path)], check=True, capture_output=True)
+        subprocess.run([sys.executable, str(tool), "dump", str(build), str(graph)], check=True, capture_output=True)
 
     @classmethod
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def select(self, changed):
+    def select(self, changed, since=None):
         source_root, targets = build_mingw_host_only_tests.read_reply(Path(os.path.realpath(self.build)))
+        listed = self.root / "graph-changed.txt"
+        listed.write_text("\n".join(changed if since is None else since), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
-            graph, since = build_mingw_host_only_tests.read_graph(self.graph_path)
+            graph, since = build_mingw_host_only_tests.read_graph(self.graph_path, listed)
         self.assertIsNotNone(graph)
         return build_mingw_host_only_tests.host_only_test_targets(source_root, targets, changed, graph, since)
 
@@ -668,6 +738,16 @@ class GraphSelectionFromARealBuild(unittest.TestCase):
     def test_an_unknown_header_selects_every_executable(self):
         self.assertEqual(self.select(["core/libs/tests/Third.h"]), ["first_tests", "second_tests"])
 
+    def test_a_source_globbed_into_a_library_after_the_graph_selects_every_executable(self):
+        extra = "core/common/Extra.c"
+        project = dict(self.PROJECT, **{extra: "#include \"../libs/tests/Second.h\"\nint extra(void) { return SECOND; }\n"})
+        graph = self.root / "later-graph.json"
+        self.build_and_dump(project, self.root / "later-source", self.root / "later-build", graph)
+        closures = json.loads(graph.read_text(encoding="utf-8"))["closures"]
+        self.assertIn("core/libs/tests/Second.h", next(files for output, files in closures.items() if "first_tests" in output))
+        self.assertEqual(self.select(["core/libs/tests/Second.h"], since=["core/libs/tests/Second.h", extra]),
+                         ["first_tests", "second_tests"])
+
 
 class WindowsPullRequestGateTests(unittest.TestCase):
     def test_pull_requests_select_host_and_guest_tests_from_the_test_graph(self):
@@ -676,7 +756,7 @@ class WindowsPullRequestGateTests(unittest.TestCase):
         restore = windows.split("- id: pr-graph\n", 1)[1].split("\n      - ", 1)[0]
         self.assertIn("if: github.event_name == 'pull_request'", restore)
         self.assertIn("key: test-graph-${{ runner.os }}-${{ needs.eligibility.outputs.sha }}", restore)
-        self.assertIn('git diff --no-renames --name-only "$graph" HEAD > graph-changed.txt', windows)
+        self.assertIn('git diff --no-renames --name-only -z "$graph" HEAD > graph-changed.txt', windows)
         for script in ("build_mingw_host_only_tests.py", "build_changed_guest_tests.py"):
             with self.subTest(script=script):
                 self.assertIn(f"python tools/{script} build changed.txt --graph test-graph.json "

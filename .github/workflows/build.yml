@@ -714,8 +714,8 @@ jobs:
           GRAPH_KEY: ${{ steps.pr-graph.outputs.cache-matched-key }}
         run: |
           git diff --name-only "$BASE" HEAD > changed.txt
-          graph="${GRAPH_KEY#test-graph-$RUNNER_OS-}"
-          if [ -z "$GRAPH_KEY" ] || [ ! -f test-graph.json ] || ! git diff --no-renames --name-only "$graph" HEAD > graph-changed.txt; then
+          graph="${GRAPH_KEY#"test-graph-$RUNNER_OS-"}"
+          if [ -z "$GRAPH_KEY" ] || [ ! -f test-graph.json ] || ! git diff --no-renames --name-only -z "$graph" HEAD > graph-changed.txt; then
             rm -f test-graph.json graph-changed.txt
           fi
       - name: Link changed host-only core/libs test executables

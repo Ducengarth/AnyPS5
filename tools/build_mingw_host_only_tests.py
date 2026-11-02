@@ -1,5 +1,6 @@
 import argparse
 import collections
+import functools
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,9 @@ from select_tests import FULL, LOCAL, changed_paths as read_changed_paths, load_
 
 HOST_BROAD_CHANGES = {"CMakeLists.txt", ".github/workflows/build.yml", "tools/build_mingw_host_only_tests.py"}
 HEADERS = (".h", ".hh", ".hpp", ".inl")
-COMPILED = (".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm", ".s", ".asm")
+INCLUDED = HEADERS + (".hxx", ".h++", ".inc", ".ipp", ".tcc", ".tpp", ".def", ".manifest")
+COMPILED = (".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm", ".s", ".asm", ".rc",
+            ".comp", ".frag", ".vert", ".geom", ".tesc", ".tese", ".glsl")
 BUILD_FILES = re.compile(f"(?:{FULL.pattern})|(?:{LOCAL.pattern})", re.IGNORECASE)
 
 
@@ -192,6 +195,7 @@ def local_build_change(path):
     return path.startswith("core/libs/") and (path.endswith(HEADERS) or Path(path).name == "CMakeLists.txt")
 
 
+@functools.lru_cache(maxsize=None)
 def graph_key(path):
     path = str(path).replace("\\", "/")
     while path.startswith("./"):
@@ -203,8 +207,10 @@ def read_graph(path, changed_since=None):
     if path is None:
         return None, None
     try:
+        if changed_since is None:
+            raise ValueError("no list of the paths changed since the commit it was written from")
         graph = load_graph(path)
-        since = None if changed_since is None else read_changed_paths(changed_since)
+        since = read_changed_paths(changed_since)
     except (OSError, ValueError) as error:
         print(f"Test graph not used; header and CMake changes select every test: {error}")
         return None, None
@@ -220,45 +226,42 @@ def own_sources(source_root, target):
     }
 
 
-def graph_test_targets(source_root, targets, selected, changed, graph, since=None):
-    if graph is None:
+def graph_test_targets(source_root, targets, selected, changed, graph, since):
+    if graph is None or since is None:
         return None
-    paths = {graph_key(path) for path in [*changed, *(since or ())] if path}
+    paths = {graph_key(path) for path in [*changed, *since] if path}
     if any(BUILD_FILES.search(path) for path in paths):
         return None
-    keys = {}
-    def key(path):
-        if path not in keys:
-            keys[path] = graph_key(path)
-        return keys[path]
     closures = collections.defaultdict(set)
     for output, files in graph["closures"].items():
-        closures[key(output)].update(map(key, files))
+        closures[graph_key(output)].update(map(graph_key, files))
     known = set().union(*closures.values())
     for test in graph["tests"].values():
-        known.update(map(key, test["registered"] + test["arguments"]))
+        known.update(map(graph_key, test["registered"] + test["arguments"]))
+    names = {path.rpartition("/")[2] for path in known}
     candidates = set(selected)
     sources = collections.defaultdict(set)
     scopes = collections.defaultdict(set)
+    others = set()
     for target in targets.values():
         name = target.get("name")
         if name not in candidates:
+            others |= own_sources(source_root, target)
             continue
         sources[name] |= own_sources(source_root, target)
         for artifact in target.get("artifacts", []):
             scopes[name] |= closures.get(graph_key(artifact.get("path", "")), set())
-    owned = set().union(*sources.values())
+    exclusive = set().union(*sources.values()) - others
     for path in paths - known:
-        if path.startswith("core/libs/") and (path.endswith(HEADERS) or path.endswith(COMPILED) and path not in owned):
+        if (path.endswith(INCLUDED) or path.rpartition("/")[2] in names
+                or path.endswith(COMPILED) and path not in exclusive):
             return None
-    affected = set()
-    for name in candidates:
-        scope, files = scopes[name], sources[name]
-        if (not any(path.endswith(HEADERS) for path in scope)
-                or not {path for path in files if path.endswith(COMPILED)} <= scope
-                or scope & paths or files & paths):
-            affected.add(name)
-    return affected
+    return {
+        name for name in candidates
+        if not any(path.endswith(HEADERS) for path in scopes[name])
+        or not {path for path in sources[name] if path.endswith(COMPILED)} <= scopes[name]
+        or scopes[name] & paths
+    }
 
 
 def changed_test_targets(source_root, targets, selected, changed_paths, broad_changes, graph=None, graph_changed=None):
