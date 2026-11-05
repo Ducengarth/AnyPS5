@@ -21,6 +21,7 @@ HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))?", re.M)
 MARKER = "<!-- pr-overlap -->"
 FETCH_REFS = 100
 PROGRESS_EVERY = 100
+PAIR_CHUNK = 1000
 _REPO_ROOTS = {}
 
 
@@ -495,6 +496,17 @@ def overlaps(prs, a, b):
 
 
 
+def compare_chunk(prs, chunk):
+    return [(a, b, found) for a, b in chunk if (found := overlaps(prs, a, b))]
+
+
+def compare_all(prs, pairs, jobs):
+    chunks = [pairs[start:start + PAIR_CHUNK] for start in range(0, len(pairs), PAIR_CHUNK)]
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        for found in executor.map(lambda chunk: compare_chunk(prs, chunk), chunks):
+            yield from found
+
+
 def code_span(item):
     item = str(item)
     runs = re.findall(r"`+", item)
@@ -663,10 +675,9 @@ def main(argv=None):
         current_exports = base_exports("refs/pr/base")
         rows = {n: {} for n in prs}
         main_exports = main_export_findings(prs, current_exports)
-        pairs = [(0, n) for n in prs if n] if args.branch else combinations(prs, 2)
-        for a, b in pairs:
-            if found := overlaps(prs, a, b):
-                rows[a][b] = rows[b][a] = found
+        pairs = [(0, n) for n in prs if n] if args.branch else list(combinations(prs, 2))
+        for a, b, found in compare_all(prs, pairs, args.jobs):
+            rows[a][b] = rows[b][a] = found
         blob = f'https://github.com/{REPO}/blob/{git("rev-parse", "refs/pr/base").strip()}'
     except subprocess.CalledProcessError as error:
         raise SystemExit(describe_failure(error))
