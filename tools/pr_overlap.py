@@ -436,11 +436,15 @@ def scan_all(prs, jobs):
 
 
 def hunks(pr, path):
+    known = pr.setdefault("hunks", {})
+    if path in known:
+        return known[path]
     diff = git("diff", "-U0", "--no-color", "refs/pr/base", pr["tree"], "--", path)
     found = []
     for start, count in HUNK.findall(diff):
         start = max(int(start), 1)
         found.append((start, start + max(int(count or 1), 1) - 1))
+    known[path] = found
     return found
 
 
