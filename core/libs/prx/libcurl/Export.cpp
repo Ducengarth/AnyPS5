@@ -1,4 +1,5 @@
 #include "prx/libcurl/src/CurlHost.hpp"
+#include "prx/libcurl/src/Mprintf.hpp"
 #include "prx/libcurl/include/InventoryExports.hpp"
 #include "prx/libcurl/include/Api.hpp"
 #include "prx/libc/include/General.hpp"
@@ -73,6 +74,100 @@ char* GuestCurlStrdup(const char* text) {
 
 void* GuestCurlCalloc(size_t count, size_t size) {
     return activeAllocators.allocateZeroed(count, size);
+}
+
+constexpr std::size_t GuestPrintfLimit = 8000000;
+constexpr std::size_t GuestPrintfFirstAllocation = 32;
+
+VaList* GuestArguments(const void* arguments) {
+    return const_cast<VaList*>(static_cast<const VaList*>(arguments));
+}
+
+struct BoundedText {
+    std::string text;
+    std::size_t max = 0;
+};
+
+struct GuestDynamicText {
+    char* buffer = nullptr;
+    std::size_t length = 0;
+    std::size_t allocated = 0;
+    bool failed = false;
+
+    void Free() {
+        GuestCurlFree(buffer);
+        buffer = nullptr;
+        length = 0;
+        allocated = 0;
+    }
+
+    bool Append(char character) {
+        const std::size_t fit = length + 2;
+        if (fit > GuestPrintfLimit) {
+            Free();
+            return false;
+        }
+        std::size_t size = allocated;
+        if (!size) {
+            size = fit < GuestPrintfFirstAllocation ? GuestPrintfFirstAllocation : fit;
+        } else {
+            while (size < fit) size *= 2;
+        }
+        if (size != allocated) {
+            auto* resized = static_cast<char*>(GuestCurlRealloc(buffer, size));
+            if (!resized) {
+                GuestCurlFree(buffer);
+                buffer = nullptr;
+                length = 0;
+                allocated = 0;
+                return false;
+            }
+            buffer = resized;
+            allocated = size;
+        }
+        const GuestArena::HostWrite write(buffer + length, 2);
+        buffer[length++] = character;
+        buffer[length] = '\0';
+        return true;
+    }
+};
+
+int AddToStream(int character, void* data) {
+    return fputc_nid_postfix(character, static_cast<FileStream*>(data));
+}
+
+int AddToText(int character, void* data) {
+    static_cast<std::string*>(data)->push_back(static_cast<char>(character));
+    return character;
+}
+
+int AddToBoundedText(int character, void* data) {
+    auto& output = *static_cast<BoundedText*>(data);
+    if (output.text.size() >= output.max) return -1;
+    output.text.push_back(static_cast<char>(character));
+    return character;
+}
+
+int AddToDynamicText(int character, void* data) {
+    auto& output = *static_cast<GuestDynamicText*>(data);
+    if (!output.Append(static_cast<char>(character))) {
+        output.failed = true;
+        return -1;
+    }
+    return character;
+}
+
+void StoreBytes(char* destination, const std::string& text) {
+    if (text.empty()) return;
+    if (!destination) NotImplemented_nid_no_patch("curl_mprintf: a null output buffer");
+    const GuestArena::HostWrite write(destination, text.size());
+    std::memcpy(destination, text.data(), text.size());
+}
+
+void StoreTerminated(char* destination, const std::string& text) {
+    if (!destination) NotImplemented_nid_no_patch("curl_mprintf: a null output buffer");
+    const GuestArena::HostWrite write(destination, text.size() + 1);
+    std::memcpy(destination, text.c_str(), text.size() + 1);
 }
 
 const bool guestAllocatorInstalled = [] {
@@ -869,43 +964,79 @@ void APS5_VABI curl_mime_free_nid_postfix(curl_mime* mime) {
 
 
 int APS5_VABI curl_mvfprintf_nid_postfix(std::FILE* whereto, const char* format, VaList* args) {
-    NotImplemented_nid_no_patch(__func__);
+    return CurlPrintf::Format(whereto, AddToStream, format, args);
 }
 
 int APS5_VABI curl_mfprintf_nid_postfix(std::FILE* whereto, const char* format, ...) {
-    NotImplemented_nid_no_patch(__func__);
+    CURL_ARGS_START(format);
+    const int result = CurlPrintf::Format(whereto, AddToStream, format, GuestArguments(args));
+    CURL_ARGS_END();
+    return result;
 }
 
 int APS5_VABI curl_mvsprintf_nid_postfix(char* buffer, const char* format, VaList* args) {
-    NotImplemented_nid_no_patch(__func__);
+    std::string text;
+    const int result = CurlPrintf::Format(&text, AddToText, format, args);
+    StoreTerminated(buffer, text);
+    return result;
 }
 
 int APS5_VABI curl_msprintf_nid_postfix(char* buffer, const char* format, ...) {
-    NotImplemented_nid_no_patch(__func__);
+    CURL_ARGS_START(format);
+    const int result = curl_mvsprintf_nid_postfix(buffer, format, GuestArguments(args));
+    CURL_ARGS_END();
+    return result;
 }
 
 int APS5_VABI curl_mvsnprintf_nid_postfix(char* buffer, size_t maxlength, const char* format, VaList* args) {
-    NotImplemented_nid_no_patch(__func__);
+    BoundedText output{{}, maxlength};
+    int result = CurlPrintf::Format(&output, AddToBoundedText, format, args);
+    if (result != -1 && maxlength) {
+        if (output.text.size() == maxlength) {
+            output.text.back() = '\0';
+            --result;
+            StoreBytes(buffer, output.text);
+        } else {
+            StoreTerminated(buffer, output.text);
+        }
+    }
+    return result;
 }
 
 int APS5_VABI curl_msnprintf_nid_postfix(char* buffer, size_t maxlength, const char* format, ...) {
-    NotImplemented_nid_no_patch(__func__);
+    CURL_ARGS_START(format);
+    const int result = curl_mvsnprintf_nid_postfix(buffer, maxlength, format, GuestArguments(args));
+    CURL_ARGS_END();
+    return result;
 }
 
 int APS5_VABI curl_mvprintf_nid_postfix(const char* format, VaList* args) {
-    NotImplemented_nid_no_patch(__func__);
+    return CurlPrintf::Format(&_Stdout_nid_postfix, AddToStream, format, args);
 }
 
 int APS5_VABI curl_mprintf_nid_postfix(const char* format, ...) {
-    NotImplemented_nid_no_patch(__func__);
+    CURL_ARGS_START(format);
+    const int result = CurlPrintf::Format(&_Stdout_nid_postfix, AddToStream, format, GuestArguments(args));
+    CURL_ARGS_END();
+    return result;
 }
 
 char* APS5_VABI curl_mvaprintf_nid_postfix(const char* format, VaList* args) {
-    NotImplemented_nid_no_patch(__func__);
+    GuestDynamicText output;
+    const int result = CurlPrintf::Format(&output, AddToDynamicText, format, args);
+    if (result == -1 || output.failed) {
+        output.Free();
+        return nullptr;
+    }
+    if (output.length) return output.buffer;
+    return GuestCurlStrdup("");
 }
 
 char* APS5_VABI curl_maprintf_nid_postfix(const char* format, ...) {
-    NotImplemented_nid_no_patch(__func__);
+    CURL_ARGS_START(format);
+    char* const result = curl_mvaprintf_nid_postfix(format, GuestArguments(args));
+    CURL_ARGS_END();
+    return result;
 }
 
 std::int32_t APS5_VABI curl_share_cleanup_nid_postfix(CURLSH* share_handle) {
