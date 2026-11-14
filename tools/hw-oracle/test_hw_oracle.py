@@ -248,12 +248,32 @@ class InputRowsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             body, rows = Path(tmp) / "body.s", Path(tmp) / "rows.txt"
             body.write_text("s_nop 0")
-            rows.write_text("0001 08 0xFFFFFFFF 0b10\n")
+            rows.write_text("0001 08 0xFFFFFFFF 0X2\n")
             argv = ["hw_oracle.py", str(body), str(rows)]
             argv += [item for name, value in MODES.items() for item in ["--" + name.replace("_", "-"), str(value)]]
             with patch("sys.argv", argv), patch.object(hw_oracle, "run", return_value=[]) as run:
                 hw_oracle.main()
             self.assertEqual(run.call_args.args[1], [(1, 8, 0xffffffff, 2)])
+
+    def test_validation_accepts_only_decimal_and_0x_hex_words(self):
+        with tempfile.TemporaryDirectory() as directory:
+            body, rows = Path(directory) / "body.s", Path(directory) / "rows.txt"
+            body.write_text("s_nop 0", encoding="utf-8")
+            argv = ["hw_oracle.py", str(body), str(rows), "--validate-only"]
+            argv += [part for name, value in MODES.items() for part in ["--" + name.replace("_", "-"), str(value)]]
+            for word in ("1_0", "١", "１", "0b11", "0o7", "+5", "-0", "0x", "0x1_0", "x10", "1e2"):
+                rows.write_text(f"{word} 2 3 4\n", encoding="utf-8")
+                with self.subTest(word=word), patch("sys.argv", argv), \
+                        contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()) as errors, \
+                        self.assertRaises(SystemExit) as exited:
+                    hw_oracle.main()
+                self.assertEqual(exited.exception.code, 2)
+                self.assertIn("error: input word must be decimal or 0x hex", errors.getvalue())
+                self.assertEqual(output.getvalue(), "")
+            rows.write_text("0 0010 0xff 0XFFFFFFFF\n", encoding="utf-8")
+            with patch("sys.argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(hw_oracle.main(), 0)
 
     def test_validation_only_reports_dispatch_shape_without_running_tools(self):
         with tempfile.TemporaryDirectory() as directory:

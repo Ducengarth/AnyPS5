@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import operator
+import re
 import shlex
 import shutil
 import struct
@@ -203,10 +204,11 @@ def run(body, rows, extra=b"", wave64=False, coarse=False, *, ieee, denorm32, de
 
 
 def parse_word(value):
-    try:
-        return int(value, 0)
-    except ValueError:
+    if re.fullmatch(r"[0-9]+", value):
         return int(value, 10)
+    if re.fullmatch(r"0[xX][0-9a-fA-F]+", value):
+        return int(value, 16)
+    raise ValueError(f"input word must be decimal or 0x hex: {ascii(value)}")
 
 
 def main():
