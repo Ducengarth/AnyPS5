@@ -1173,5 +1173,22 @@ class ArgumentAndPathTests(unittest.TestCase):
             self.assertEqual(annotate_module.resolved_path(missing), missing.resolve())
 
 
+class NidDatabaseErrorTests(unittest.TestCase):
+    def test_database_without_nid_records_is_a_controlled_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "input.prx"
+            module.write_bytes(build_module())
+            database = root / "empty.csv"
+            database.write_text("# no records\n", encoding="utf-8")
+            with mock.patch.object(annotate_module, "gnu_objdump", return_value="objdump"), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as stopped:
+                    annotate_module.main([str(module), "--out", str(root / "report"), "--db", str(database)])
+            self.assertIn("no valid NID records", str(stopped.exception))
+            self.assertNotIn("Traceback", errors.getvalue())
+            self.assertFalse((root / "report.asm").exists())
+
+
 if __name__ == "__main__":
     unittest.main(defaultTest=os.environ.get("ANNOTATE_MODULE_TEST"))

@@ -571,7 +571,7 @@ def main(argv=None):
                               "tls_exports": entries(thread_local)}, ensure_ascii=False, indent=2))
         else:
             print(annotate(args.module, args.out or args.module, namer))
-    except (ModuleError, OSError, UnicodeError) as error:
+    except (ModuleError, OSError, ValueError) as error:
         sys.exit("%s: %s" % (args.module, error))
     return 0
 
