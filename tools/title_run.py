@@ -1211,6 +1211,14 @@ def write_summary(output, summary):
     (output / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
 
 
+def comparable(summary):
+    titles = summary.get("titles") if isinstance(summary, dict) else None
+    return isinstance(titles, dict) and all(
+        isinstance(title, dict) and isinstance(title.get("runs"), list) and title["runs"]
+        and all(isinstance(run, dict) and run.get("outcome") in OUTCOMES for run in title["runs"])
+        for title in titles.values())
+
+
 def run_cli(argv, capture_resources):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -1246,6 +1254,8 @@ def run_cli(argv, capture_resources):
         previous = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
     except (OSError, ValueError) as error:
         parser.error(f"--compare: {error}")
+    if args.compare and not comparable(previous):
+        parser.error("--compare: expected a summary.json whose titles each list runs with an outcome")
     platform = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
     try:
         titles = load_titles(args.titles)

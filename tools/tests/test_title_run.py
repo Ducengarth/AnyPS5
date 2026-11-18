@@ -654,6 +654,22 @@ class PreparationTests(unittest.TestCase):
                 self.assertIn(message, errors.getvalue())
                 self.assertFalse((self.root / "out").exists())
 
+    def test_comparison_file_must_hold_title_runs_before_any_title_runs(self):
+        import contextlib
+        import io
+        package(self.root / "games/PPSA00001", "PPSA00001")
+        path = self.root / "compare.json"
+        for data in ({}, {"titles": []}, {"titles": {"PPSA00001": {"name": "Game"}}}, {"titles": {"PPSA00001": {"runs": {}}}},
+                     {"titles": {"PPSA00001": {"runs": []}}}, {"titles": {"PPSA00001": {"runs": [{"fps": 60.0}]}}}):
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.subTest(data=data):
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    title_run.main(["--games", str(self.root / "games"), "--out", str(self.root / "out"), "--compare", str(path)])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("error: --compare: ", errors.getvalue())
+                self.assertFalse((self.root / "out").exists())
+
     def test_smoke_runs_the_marked_titles(self):
         for title_id in ("PPSA00001", "PPSA00002", "PPSA00003"):
             package(self.root / "games" / title_id, title_id)
