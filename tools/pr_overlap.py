@@ -909,7 +909,10 @@ def main(argv=None):
             progress("overlap check failed closed; manually compare every reported PR branch before opening this one")
             return 2
         return 0
-    write_reports(args.out, rows, blob, main_exports)
+    try:
+        write_reports(args.out, rows, blob, main_exports)
+    except OSError as error:
+        raise SystemExit(f"pr_overlap: {error}")
     return 0
 
 
