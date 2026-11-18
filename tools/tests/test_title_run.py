@@ -746,6 +746,24 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "is not a title ID"):
                 title_run.discover([self.root / str(index)])
 
+    def test_title_package_metadata_errors_are_reported_without_a_traceback(self):
+        import contextlib
+        import io
+        for index, text in enumerate(('{"titleId": "PPSA00001", ', "[]", '{"contentVersion": "01.000.000"}',
+                                      '{"titleId": "PPSA00001", "localizedParameters": []}')):
+            with self.subTest(text=text):
+                root = self.root / f"case{index}"
+                package(root / "PPSA00001", "PPSA00001")
+                (root / "PPSA00001/sce_sys/param.json").write_text(text, encoding="utf-8")
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    title_run.main(["--games", str(root), "--out", str(self.root / f"out{index}")])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("error: --games: ", errors.getvalue())
+                self.assertIn("param.json", errors.getvalue())
+                self.assertNotIn("Traceback", errors.getvalue())
+                self.assertFalse((self.root / f"out{index}").exists())
+
     def test_unwrap_or_copy_keeps_an_elf(self):
         source = self.root / "eboot.bin"
         source.write_bytes(b"\x7fELF" + bytes(60))

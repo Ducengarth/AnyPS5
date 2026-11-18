@@ -458,7 +458,12 @@ def discover(directories, wanted=(), packages=None):
             package = param.parent.parent
             if not (package / "eboot.bin").is_file():
                 continue
-            data = json.loads(param.read_text(encoding="utf-8-sig"))
+            try:
+                data = json.loads(param.read_text(encoding="utf-8-sig"))
+            except ValueError as error:
+                raise ValueError(f"{param}: {error}") from error
+            if not isinstance(data, dict):
+                raise ValueError(f"{param}: param.json must be an object")
             title_id = data.get("titleId")
             if not isinstance(title_id, str):
                 raise ValueError(f"{param}: no titleId")
@@ -473,7 +478,11 @@ def discover(directories, wanted=(), packages=None):
                     continue
                 raise ValueError(f"{title_id} found more than once: {found[title_id]['package']} and {package}")
             localized = data.get("localizedParameters", {})
-            name = localized.get(localized.get("defaultLanguage", "en-US"), {}).get("titleName", title_id)
+            language = localized.get("defaultLanguage", "en-US") if isinstance(localized, dict) else None
+            names = localized.get(language, {}) if isinstance(language, str) else None
+            if not isinstance(names, dict):
+                raise ValueError(f"{param}: localizedParameters must be an object with an object for its default language")
+            name = names.get("titleName", title_id)
             found[title_id] = {"package": package, "version": data.get("contentVersion", ""), "name": name}
     return found
 
@@ -1256,7 +1265,10 @@ def run_cli(argv, capture_resources):
         if not args.ids:
             raise SystemExit(f"no title in {args.titles} is marked smoke")
     packages = []
-    found = discover(args.games, args.ids, packages=packages)
+    try:
+        found = discover(args.games, args.ids, packages=packages)
+    except (OSError, ValueError) as error:
+        parser.error(f"--games: {error}")
     ids = args.ids or sorted(found)
     if not ids:
         raise SystemExit(f"no title package under --games: {', '.join(str(directory) for directory in args.games)}")
