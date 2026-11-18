@@ -11,7 +11,7 @@ from check_conventions import DEBT as INDEX, debt_name
 
 DEBT_DIR = "docs/dev/debt"
 HEADING = re.compile(r"^(#{1,6}) (.+?)\s*$")
-LINK = re.compile(r"\]\((?:<((?:[^<>\n\\]|\\.)*)>|([^)\s<][^)\s]*))\)")
+LINK = re.compile(r"\]\((?:<((?:[^<>\n\\]|\\.)*)>|([^)\s<][^)\s]*))(\s+(?:\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\)))?\)")
 
 
 def parse(text):
@@ -60,7 +60,8 @@ def relink_unfenced(text, source, destination):
         path, _, anchor = target.partition("#")
         resolved = posixpath.normpath(posixpath.join(posixpath.dirname(source), path)) if path else source
         moved = posixpath.relpath(resolved, posixpath.dirname(destination)) + ("#" + anchor if anchor else "")
-        return "](<" + moved + ">)" if angled else "](" + moved + ")"
+        title = match.group(3) or ""
+        return "](<" + moved + ">" + title + ")" if angled else "](" + moved + title + ")"
 
     runs = list(re.finditer(r"`+", text))
     result = []

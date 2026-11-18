@@ -135,6 +135,23 @@ class DebtSplitTests(unittest.TestCase):
             expected,
         )
 
+    def test_relink_rewrites_destinations_that_have_a_title(self):
+        source = "docs/dev/TechnicalDebt.md"
+        destination = "docs/dev/debt/example.md"
+
+        cases = {
+            '[a](../../core/x.cpp "title")': '[a](../../../core/x.cpp "title")',
+            "[a](../../core/x.cpp 'title')": "[a](../../../core/x.cpp 'title')",
+            "[a](../../core/x.cpp (title))": "[a](../../../core/x.cpp (title))",
+            '[a](<../../core/x.cpp> "title")': '[a](<../../../core/x.cpp> "title")',
+            '[a](../../core/x.cpp#y "say \\"hi\\"")': '[a](../../../core/x.cpp#y "say \\"hi\\"")',
+            "[a](#intro 'title')": "[a](../TechnicalDebt.md#intro 'title')",
+            "[a](../../core/x.cpp bare words)": "[a](../../core/x.cpp bare words)",
+        }
+        for original, expected in cases.items():
+            with self.subTest(original=original):
+                self.assertEqual(debt_split.relink(original, source, destination), expected)
+
     def test_relink_preserves_code_after_real_link(self):
         source = "docs/dev/TechnicalDebt.md"
         destination = "docs/dev/debt/example.md"
