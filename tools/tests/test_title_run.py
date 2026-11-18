@@ -58,6 +58,13 @@ class TitlesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "PPSA00001: smoke must be bool"):
             title_run.load_titles(self.write({"PPSA00001": {"smoke": 1}}))
 
+    def test_catalog_and_title_entries_must_be_objects(self):
+        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+            title_run.load_titles(self.write([]))
+        for entry in ("rlink", [], None):
+            with self.subTest(entry=entry), self.assertRaisesRegex(ValueError, "PPSA00001 must be an object"):
+                title_run.load_titles(self.write({"PPSA00001": entry}))
+
     def test_catalog_seconds_must_be_a_positive_integer(self):
         for value in (True, False, 0, -1):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "PPSA00001: seconds must be a positive integer"):
