@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -40,6 +41,19 @@ class BuildMingwHostOnlyTestsTests(unittest.TestCase):
         self.assertTrue(build_mingw_host_only_tests.link_command_mentions_target("a.o -lfoo", target))
         self.assertFalse(build_mingw_host_only_tests.link_command_mentions_target("a.o -lfoobar", target))
         self.assertFalse(build_mingw_host_only_tests.link_command_mentions_target("a.o -lbar", target))
+
+    def test_host_only_selection_ignores_a_tests_folder_above_core_libs(self):
+        def executable(name, source_dir, source_name):
+            return {"id": name, "name": name, "type": "EXECUTABLE", "paths": {"source": source_dir},
+                    "sources": [{"path": f"{source_dir}/{source_name}"}],
+                    "link": {"commandFragments": [{"fragment": "-lm"}]}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = (Path(directory) / "tests" / "checkout").resolve()
+            product = executable("prx_product", "core/libs/prx/product", "main.cpp")
+            test = executable("prx_product_tests", "core/libs/tests", "Product.cpp")
+            targets = {target["id"]: target for target in (product, test)}
+            self.assertEqual(build_mingw_host_only_tests.host_only_test_targets(root, targets), ["prx_product_tests"])
 
 
 if __name__ == "__main__":

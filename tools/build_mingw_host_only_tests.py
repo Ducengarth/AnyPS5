@@ -86,6 +86,11 @@ def is_core_libs_test_source(source_path, core_libs):
     return "tests" in relative.parent.parts
 
 
+def is_under_core_libs_tests(source, source_root):
+    core_libs = source_root / "core" / "libs"
+    return source.is_relative_to(core_libs) and "tests" in source.relative_to(core_libs).parent.parts
+
+
 def is_product_library(target, source_root):
     if target.get("type") not in {"STATIC_LIBRARY", "SHARED_LIBRARY", "MODULE_LIBRARY"}:
         return False
@@ -205,7 +210,7 @@ def host_only_test_targets(source_root, targets, changed_paths=None):
         except ValueError:
             continue
         sources = [source_root / source["path"] for source in target.get("sources", []) if not source.get("isGenerated")]
-        if not any("tests" in source.parts and source.is_relative_to(source_root / "core" / "libs") for source in sources):
+        if not any(is_under_core_libs_tests(source, source_root) for source in sources):
             continue
         if links_guest_libc(target) or links_product_library(target, targets, source_root):
             continue

@@ -29,8 +29,8 @@ class GuestTestTargets(unittest.TestCase):
             "type": target_type,
         }
 
-    def fixture(self, targets):
-        directory = Path(self.temporary.name)
+    def fixture(self, targets, directory=None):
+        directory = Path(directory or self.temporary.name)
         reply = directory / "build" / ".cmake" / "api" / "v1" / "reply"
         reply.mkdir(parents=True)
         entries = []
@@ -53,6 +53,12 @@ class GuestTestTargets(unittest.TestCase):
     def selections(self, build, changed):
         source_root, targets = build_changed_guest_tests.host_only.read_reply(build.resolve())
         return build_changed_guest_tests.guest_test_targets(source_root, targets, changed)
+
+    def test_checkout_under_a_tests_folder_selects_only_core_libs_test_sources(self):
+        checkout = Path(self.temporary.name) / "tests" / "checkout"
+        product = self.target("guest_product", source="core/libs/prx/product/Main.cpp", fragment="libc.prx")
+        guest = self.target("guest_pad_tests", source="core/libs/tests/Guest.cpp", fragment="libc.prx")
+        self.assertEqual(self.selections(self.fixture([product, guest], checkout), None), ["guest_pad_tests"])
 
     def test_selects_core_libs_test_executables_with_guest_libc(self):
         guest = self.target("guest_pad_tests", fragment="libc.prx")
