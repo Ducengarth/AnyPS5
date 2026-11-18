@@ -402,6 +402,17 @@ class TraceDigestTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(result.stdout, "")
 
+    def test_cli_reports_a_summary_line_without_a_rendered_field(self):
+        summary = self.trace.with_name("aps5-summary.jsonl")
+        record = {key: value for key, value in SUMMARY.items() if key != "gpu"}
+        summary.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, trace_digest.__file__, str(self.trace)],
+                                capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(result.stderr.startswith("FAIL: the summary line has no 'gpu' field"), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_cli_rejects_invalid_summary_records_without_partial_output(self):
         summary = self.trace.with_name("aps5-summary.jsonl")
         explicit = summary.with_name("explicit-\u03a9.jsonl")
