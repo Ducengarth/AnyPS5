@@ -1715,6 +1715,17 @@ void CheckClearDispatch() {
     }
 }
 
+bool driverClearUnavailable = false;
+
+bool DriverClearNeedsImports(std::string_view failure, std::uint64_t htileAddress, std::size_t bytes) {
+    if (failure.find("sample-preserving guest publication of native multisample depth is not implemented") == std::string_view::npos) return false;
+    const auto driverDevice = AgcDriver::DriverDetail::DriverTestAccess::GetDevice();
+    if (driverDevice == nullptr || HostImportFor(driverDevice->graphicsContext(), htileAddress, bytes) != nullptr) return false;
+    std::puts("skipped the driver HTILE clear dispatch, host imports are unavailable: the driver cannot import the HTILE metadata, and publishing native multisample depth through a copy is not implemented");
+    driverClearUnavailable = true;
+    return true;
+}
+
 void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments, bool one, bool clearing, std::optional<bool> depthOnlyOverride, ClearFault fault, ClearSource source, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpuLock, bool iterate256 = true) {
     const bool filling = source != ClearSource::HtileDispatch;
     const VkExtent2D extent{5u, 3u};
@@ -1878,6 +1889,7 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
                         catch (const std::exception& error) { failure = error.what(); }
                         Recorder::FailNextSubmitsForTest(0u);
                         recorder.Activate();
+                        if (DriverClearNeedsImports(failure, target.htileAddress, metadataBytes)) return;
                         Require(ArmedHtileDepthClearCount() == armedClears + 1u, "the HTILE clear dispatch was not armed exactly once before its batch failed (" + std::to_string(ArmedHtileDepthClearCount() - armedClears) + " armed; failure '" + failure + "')");
                         if (failure.find("injected failure") == std::string::npos) {
                             const auto [accepted, completed] = AgcDriver::DriverDetail::DriverTestAccess::SerialProgress();
@@ -1905,7 +1917,13 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
                             }
                         } shutdownDriver;
                         const auto generation = AgcDriver::GuestMemory::TrackerGeneration();
-                        const auto driverContext = SubmitDriverHtileClear(target.htileAddress, gpuLock, fault == ClearFault::DriverBufferDispatch);
+                        std::optional<Context> submitted;
+                        try { submitted = SubmitDriverHtileClear(target.htileAddress, gpuLock, fault == ClearFault::DriverBufferDispatch); }
+                        catch (const std::exception& error) {
+                            if (!DriverClearNeedsImports(error.what(), target.htileAddress, metadataBytes)) throw;
+                            return;
+                        }
+                        const auto driverContext = *submitted;
                         recorder.Activate();
                         Require(Recorder::Active() == &recorder, "driver idle did not restore the native depth fixture recorder");
                         if (!AgcDriver::GuestMemory::Watched(target.htileAddress, metadataBytes)) {
@@ -5809,7 +5827,8 @@ int main(int argc, char** argv) {
             CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, ClearFault::ImportWindowWrite, ClearSource::HtileDispatch, lock);
             ++checked;
             CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, ClearFault::DriverDispatch, ClearSource::HtileDispatch, lock);
-            ++checked;
+            if (driverClearUnavailable) ++unavailable;
+            else ++checked;
             std::printf("Native depth completed clear cases checked=%u unavailable=%u\n", checked, unavailable);
             return 0;
         }
@@ -6027,11 +6046,13 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--discarded-clear") {
             CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, ClearFault::DiscardedArm, ClearSource::HtileDispatch, lock);
             CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, ClearFault::DiscardedDispatch, ClearSource::HtileDispatch, lock);
+            if (driverClearUnavailable) return VulkanTestSkipped;
             std::puts("Native depth clear dispatch in a discarded batch checked");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--buffer-clear") {
             CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, ClearFault::DriverBufferDispatch, ClearSource::HtileDispatch, lock);
+            if (driverClearUnavailable) return VulkanTestSkipped;
             std::puts("Native depth clear by the buffer HTILE mask kernel through PM4 checked");
             return 0;
         }
